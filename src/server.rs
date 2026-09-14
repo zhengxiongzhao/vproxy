@@ -11,11 +11,14 @@ use std::{
     io::{self as std_io, IsTerminal},
     net::SocketAddr,
     num::NonZeroUsize,
+    sync::Arc,
     time::Duration,
 };
 
+use socket2::TcpKeepalive;
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
     task::JoinSet,
     time::timeout,
 };
@@ -31,6 +34,40 @@ const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 // A bounded default that accommodates common QUIC packets without reserving a
 // maximum-sized UDP datagram for every active relay.
 const MAX_UDP_RELAY_PAYLOAD_SIZE: usize = 1_500;
+
+// TCP keepalive for accepted inbound connections: after 60s of idle time the
+// kernel probes the peer 9 times every 15s; a silently-vanished peer (NAT
+// timeout, crash, network partition) is detected within ~195s and the socket is
+// reset, so half-open tunnels no longer pin their fds and buffers forever.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Shared admission-control semaphore backing the `-c/--concurrent` limit.
+///
+/// Each accepted inbound connection acquires one permit for its whole
+/// lifetime; when the server is at capacity new connections are closed
+/// immediately instead of piling up.
+pub(crate) type ConnectionLimiter = Arc<Semaphore>;
+
+/// Creates the connection limiter with `limit` available permits.
+pub(crate) fn connection_limiter(limit: u32) -> ConnectionLimiter {
+    let permits = usize::try_from(limit).unwrap_or(usize::MAX);
+    Arc::new(Semaphore::new(permits))
+}
+
+/// Applies kernel-level TCP keepalive to an accepted inbound stream.
+///
+/// Central choke point: every server funnels accepted sockets through
+/// [`Server::incoming`], so inbound keepalive only needs to be set here.
+pub(crate) fn set_inbound_keepalive(stream: &TcpStream) {
+    let socket = socket2::SockRef::from(stream);
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
+        tracing::trace!("failed to set inbound TCP keepalive: {error}");
+    }
+}
 
 fn is_oversized_datagram_error(error: &std_io::Error) -> bool {
     let Some(code) = error.raw_os_error() else {
@@ -62,11 +99,17 @@ pub trait Server {
     async fn start(self, handle: Handle) -> std::io::Result<()>;
 
     /// Accepts incoming TCP connections with retry on temporary failures.
+    ///
+    /// Accepted streams get kernel TCP keepalive so half-open connections are
+    /// eventually reclaimed by the OS (see [`set_inbound_keepalive`]).
     #[inline]
     async fn incoming(listener: &mut TcpListener) -> (TcpStream, SocketAddr) {
         loop {
             match listener.accept().await {
-                Ok(conn) => return conn,
+                Ok(conn) => {
+                    set_inbound_keepalive(&conn.0);
+                    return conn;
+                }
                 Err(error) => {
                     tracing::trace!("Failed to accept connection: {error}");
                     tokio::time::sleep(Duration::from_millis(50)).await
@@ -144,10 +187,13 @@ pub fn run(args: BootArgs) -> Result<()> {
             args.bind,
         );
 
+        let limiter = connection_limiter(args.concurrent);
+
         let context = move |auth: AuthMode| Context {
             auth,
             bind: args.bind,
             concurrent: args.concurrent,
+            limiter: limiter.clone(),
             connect_timeout: args.connect_timeout,
             connector: Connector::new(
                 args.cidr,

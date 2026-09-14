@@ -6,6 +6,7 @@ mod proto;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::BytesMut;
@@ -34,12 +35,14 @@ use crate::connect::{Connector, TcpConnector, UdpConnector};
 pub struct Socks5Acceptor {
     auth: Arc<AuthAdaptor>,
     connector: Connector,
+    handshake_timeout: Duration,
 }
 
 /// SOCKS5 server.
 pub struct Socks5Server {
     listener: TcpListener,
     acceptor: Socks5Acceptor,
+    limiter: super::ConnectionLimiter,
 }
 
 // ===== impl Socks5Acceptor =====
@@ -55,6 +58,7 @@ impl Socks5Acceptor {
         Socks5Acceptor {
             auth: Arc::new(auth),
             connector: ctx.connector,
+            handshake_timeout: Duration::from_secs(ctx.connect_timeout),
         }
     }
 }
@@ -65,6 +69,7 @@ impl Acceptor for Socks5Acceptor {
             IncomingConnection::new(stream, self.auth),
             socket_addr,
             self.connector,
+            self.handshake_timeout,
         )
         .await
         {
@@ -89,7 +94,8 @@ impl Socks5Server {
         socket.bind(ctx.bind)?;
         socket.listen(ctx.concurrent).map(|listener| Socks5Server {
             listener,
-            acceptor: Socks5Acceptor::new(ctx),
+            acceptor: Socks5Acceptor::new(ctx.clone()),
+            limiter: ctx.limiter,
         })
     }
 }
@@ -111,8 +117,19 @@ impl Server for Socks5Server {
                     }
                 }
                 conn = Socks5Server::incoming(&mut self.listener) => {
+                    // Admission control: at capacity, close new connections
+                    // immediately instead of letting them pile up.
+                    let Ok(permit) = self.limiter.clone().try_acquire_owned() else {
+                        tracing::debug!("[SOCKS5] concurrent limit reached, rejecting connection");
+                        continue;
+                    };
+                    let acceptor = self.acceptor.clone();
+                    let connection_handle = handle.clone();
                     connections.spawn_on(
-                        self.acceptor.clone().accept(conn, handle.clone()),
+                        async move {
+                            let _permit = permit;
+                            acceptor.accept(conn, connection_handle).await
+                        },
                         &pingora_runtime::current_handle(),
                     );
                 }
@@ -127,19 +144,37 @@ async fn handle(
     conn: IncomingConnection,
     socket_addr: SocketAddr,
     connector: Connector,
+    handshake_timeout: Duration,
 ) -> std::io::Result<()> {
-    let (conn, extension) = match conn.authenticate().await {
-        Ok(authenticated) => authenticated,
-        Err(error) => {
-            if error.is_rejected() {
-                tracing::trace!("[SOCKS5] authentication failed for {socket_addr}: {error}");
-                return Ok(());
+    // Bound only the handshake (method negotiation + optional password auth +
+    // request); established tunnels are reclaimed by kernel TCP keepalive.
+    let (conn, extension) = match tokio::time::timeout(handshake_timeout, conn.authenticate()).await
+    {
+        Ok(result) => match result {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                if error.is_rejected() {
+                    tracing::trace!("[SOCKS5] authentication failed for {socket_addr}: {error}");
+                    return Ok(());
+                }
+                return Err(error.into_io_error());
             }
-            return Err(error.into_io_error());
+        },
+        Err(_) => {
+            tracing::trace!("[SOCKS5] authentication timed out for {socket_addr}");
+            return Ok(());
         }
     };
 
-    match conn.wait_request().await? {
+    let request = match tokio::time::timeout(handshake_timeout, conn.wait_request()).await {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::trace!("[SOCKS5] request timed out for {socket_addr}");
+            return Ok(());
+        }
+    };
+
+    match request {
         ClientConnection::UdpAssociate(associate, address) => {
             handle_udp(associate, address, connector.udp(extension)).await
         }
@@ -734,6 +769,7 @@ mod tests {
                 IncomingConnection::new(stream, Arc::new(AuthAdaptor::no())),
                 peer,
                 test_connector(),
+                Duration::from_secs(10),
             )
             .await
         });
@@ -922,9 +958,14 @@ mod tests {
                 let auth = Arc::clone(&auth);
                 let connector = connector.clone();
                 tokio::spawn(async move {
-                    handle(IncomingConnection::new(stream, auth), peer, connector)
-                        .await
-                        .unwrap();
+                    handle(
+                        IncomingConnection::new(stream, auth),
+                        peer,
+                        connector,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
                 });
             }
         });
@@ -1013,6 +1054,7 @@ mod tests {
                     ),
                     peer,
                     test_connector(),
+                    Duration::from_secs(10),
                 )
                 .await
             });

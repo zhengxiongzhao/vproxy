@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use super::{AuthMode, Connector};
+use super::{AuthMode, ConnectionLimiter, Connector};
 
 /// Server context containing configuration and runtime parameters.
 ///
@@ -13,6 +13,9 @@ pub struct Context {
 
     /// Maximum number of concurrent connections allowed
     pub concurrent: u32,
+
+    /// Admission-control limiter backing `concurrent`
+    pub limiter: ConnectionLimiter,
 
     /// Connection timeout in seconds
     pub connect_timeout: u64,

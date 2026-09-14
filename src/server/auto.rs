@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use tokio::{
     io::ReadBuf,
@@ -23,6 +23,8 @@ pub struct AutoDetectServer {
         HttpAcceptor<DefaultAcceptor>,
         HttpAcceptor<RustlsAcceptor>,
     ),
+    limiter: super::ConnectionLimiter,
+    probe_timeout: Duration,
 }
 
 impl AutoDetectServer {
@@ -41,15 +43,18 @@ impl AutoDetectServer {
         socket.set_reuseaddr(true)?;
         socket.bind(ctx.bind)?;
         socket.listen(ctx.concurrent).and_then(|listener| {
+            let probe_timeout = Duration::from_secs(ctx.connect_timeout);
             HttpAcceptor::new(ctx.clone())
                 .with_https(tls_cert, tls_key)
                 .map(|https_acceptor| AutoDetectServer {
                     listener,
                     acceptor: (
                         Socks5Acceptor::new(ctx.clone()),
-                        HttpAcceptor::new(ctx),
+                        HttpAcceptor::new(ctx.clone()),
                         https_acceptor,
                     ),
+                    limiter: ctx.limiter,
+                    probe_timeout,
                 })
         })
     }
@@ -72,9 +77,17 @@ impl Server for AutoDetectServer {
                     }
                 }
                 conn = AutoDetectServer::incoming(&mut self.listener) => {
+                    // Admission control: at capacity, close new connections
+                    // immediately instead of letting them pile up.
+                    let Ok(permit) = self.limiter.clone().try_acquire_owned() else {
+                        tracing::debug!("[auto] concurrent limit reached, rejecting connection");
+                        continue;
+                    };
                     let acceptor = self.acceptor.clone();
                     let connection_handle = handle.clone();
+                    let probe_timeout = self.probe_timeout;
                     connections.spawn_on(async move {
+                        let _permit = permit;
                         // Peek the first byte to determine the protocol
                         // SOCKS5 always starts with version byte 0x05
                         // TLS/HTTPS starts with binary data (< 0x41)
@@ -83,13 +96,20 @@ impl Server for AutoDetectServer {
                         let mut buf = ReadBuf::new(&mut protocol);
                         let peeked = tokio::select! {
                             _ = connection_handle.wait_graceful_shutdown() => return,
+                            // A client that connects but never sends a byte
+                            // must not pin its connection forever.
+                            _ = tokio::time::sleep(probe_timeout) => {
+                                tracing::trace!("[auto] protocol probe timed out");
+                                return;
+                            }
                             result = std::future::poll_fn(|cx| conn.0.poll_peek(cx, &mut buf)) => result,
                         };
                         if peeked.is_ok() {
+                            let (socks, http, https) = acceptor;
                             match protocol[0] {
-                                0x05 => acceptor.0.accept(conn, connection_handle).await,
-                                0x00..0x41 => acceptor.2.accept(conn, connection_handle).await,
-                                _ => acceptor.1.accept(conn, connection_handle).await,
+                                0x05 => socks.accept(conn, connection_handle).await,
+                                0x00..0x41 => https.accept(conn, connection_handle).await,
+                                _ => http.accept(conn, connection_handle).await,
                             }
                         }
                     }, &pingora_runtime::current_handle());

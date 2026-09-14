@@ -1,6 +1,8 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -47,6 +49,35 @@ pub struct Connector {
     tcp_user_timeout: Option<Duration>,
     reuseaddr: Option<bool>,
     http: connect::HttpConnector,
+    /// Shared upstream client pool so HTTP forward requests reuse keep-alive
+    /// connections instead of building a fresh pool per request.
+    http_pool: Arc<HttpPool>,
+}
+
+/// Maximum number of per-binding pooled clients kept in the cache. Beyond
+/// this, requests fall back to one-shot clients instead of growing the cache
+/// without bound.
+const MAX_POOLED_CLIENTS: usize = 64;
+
+/// Effective local binding for an upstream connection; used as the client
+/// pool key so a connection is never reused across different source bindings.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PoolKey {
+    /// No local binding.
+    Default,
+    /// Single local address (IPv4 or IPv6).
+    Addr(IpAddr),
+    /// Dual-stack local address pair.
+    Addrs(Ipv4Addr, Ipv6Addr),
+    /// Outbound interface binding (Unix only).
+    #[cfg(unix)]
+    Interface(String),
+}
+
+/// Cache of shared upstream HTTP clients keyed by local binding.
+#[derive(Default)]
+struct HttpPool {
+    clients: Mutex<HashMap<PoolKey, Arc<Client<connect::HttpConnector, Incoming>>>>,
 }
 
 /// `TcpConnector` is a lightweight wrapper for TCP connection settings.
@@ -143,6 +174,7 @@ impl Connector {
             tcp_user_timeout: tcp_user_timeout.map(Duration::from_secs),
             reuseaddr,
             http: http_connector,
+            http_pool: Arc::new(HttpPool::default()),
         }
     }
 
@@ -785,26 +817,35 @@ fn configure_udp_path(socket: &UdpSocket) -> std::io::Result<()> {
 
 impl HttpConnector<'_> {
     /// Sends an HTTP request using the configured `HttpConnector`.
+    ///
+    /// The underlying [`Client`] (including its connection pool) is cached and
+    /// reused across requests with the same local binding, so upstream
+    /// keep-alive connections are shared instead of rebuilt per request.
     pub async fn send_request(
         self,
         req: Request<Incoming>,
     ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
         let mut connector = self.inner.http.clone();
+        let mut key = PoolKey::Default;
+
         match (self.inner.cidr, &self.inner.fallback) {
             (Some(cidr), Some(fallback)) => match (cidr, fallback) {
                 (IpCidr::V4(cidr), Fallback::Address(IpAddr::V6(v6))) => {
                     let v4 =
                         assign_ipv4_from_extension(cidr, self.inner.cidr_range, self.extension);
                     connector.set_local_addresses(v4, *v6);
+                    key = PoolKey::Addrs(v4, *v6);
                 }
                 (IpCidr::V6(cidr), Fallback::Address(IpAddr::V4(v4))) => {
                     let v6 =
                         assign_ipv6_from_extension(cidr, self.inner.cidr_range, self.extension);
                     connector.set_local_addresses(*v4, v6);
+                    key = PoolKey::Addrs(*v4, v6);
                 }
                 #[cfg(unix)]
                 (_, Fallback::Interface(iface)) => {
                     connector.set_interface(iface);
+                    key = PoolKey::Interface(iface.clone());
                 }
                 _ => {}
             },
@@ -816,6 +857,7 @@ impl HttpConnector<'_> {
                         self.extension,
                     );
                     connector.set_local_address(Some(addr.into()));
+                    key = PoolKey::Addr(IpAddr::V4(addr));
                 }
                 IpCidr::V6(ipv6_cidr) => {
                     let addr = assign_ipv6_from_extension(
@@ -824,13 +866,18 @@ impl HttpConnector<'_> {
                         self.extension,
                     );
                     connector.set_local_address(Some(addr.into()));
+                    key = PoolKey::Addr(IpAddr::V6(addr));
                 }
             },
             (None, Some(fallback)) => match fallback {
-                Fallback::Address(addr) => connector.set_local_address(Some(*addr)),
+                Fallback::Address(addr) => {
+                    connector.set_local_address(Some(*addr));
+                    key = PoolKey::Addr(*addr);
+                }
                 #[cfg(unix)]
                 Fallback::Interface(iface) => {
                     connector.set_interface(iface);
+                    key = PoolKey::Interface(iface.clone());
                 }
             },
             _ => {}
@@ -847,13 +894,43 @@ impl HttpConnector<'_> {
             connector.set_tcp_user_timeout(Some(tcp_user_timeout));
         }
 
-        Client::builder(TokioExecutor::new())
-            .timer(TokioTimer::new())
-            .http1_title_case_headers(true)
-            .http1_preserve_header_case(true)
-            .build(connector)
-            .request(req)
-            .await
+        // Reuse a pooled client when possible so upstream keep-alive
+        // connections are shared; fall back to a one-shot client when the
+        // cache is at capacity to keep memory bounded.
+        let pooled_connector = connector.clone();
+        let client = {
+            let mut pool = self.inner.http_pool.clients.lock().unwrap();
+            if pool.len() >= MAX_POOLED_CLIENTS && !pool.contains_key(&key) {
+                None
+            } else {
+                Some(
+                    pool.entry(key)
+                        .or_insert_with(|| {
+                            Arc::new(
+                                Client::builder(TokioExecutor::new())
+                                    .timer(TokioTimer::new())
+                                    .http1_title_case_headers(true)
+                                    .http1_preserve_header_case(true)
+                                    .build(pooled_connector.clone()),
+                            )
+                        })
+                        .clone(),
+                )
+            }
+        };
+
+        match client {
+            Some(client) => client.request(req).await,
+            None => {
+                Client::builder(TokioExecutor::new())
+                    .timer(TokioTimer::new())
+                    .http1_title_case_headers(true)
+                    .http1_preserve_header_case(true)
+                    .build(connector)
+                    .request(req)
+                    .await
+            }
+        }
     }
 }
 

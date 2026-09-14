@@ -18,7 +18,7 @@ use http::{StatusCode, header, uri::Authority};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{Method, Request, Response, body::Incoming, service::service_fn, upgrade::Upgraded};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder,
 };
 use tokio::{
@@ -52,6 +52,7 @@ pub struct HttpAcceptor<A = DefaultAcceptor> {
 pub struct HttpServer<A = DefaultAcceptor> {
     listener: TcpListener,
     inner: HttpAcceptor<A>,
+    limiter: super::ConnectionLimiter,
 }
 
 // ===== impl HttpAcceptor =====
@@ -67,7 +68,16 @@ impl HttpAcceptor {
         builder
             .http1()
             .title_case_headers(true)
-            .preserve_header_case(true);
+            .preserve_header_case(true)
+            // Fail fast when a client opens a connection but never finishes
+            // sending its request head (slowloris-style hang).
+            .timer(TokioTimer::new())
+            .header_read_timeout(timeout);
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .keep_alive_interval(timeout)
+            .keep_alive_timeout(timeout);
 
         HttpAcceptor {
             acceptor,
@@ -120,7 +130,8 @@ impl HttpServer {
         socket.bind(ctx.bind)?;
         socket.listen(ctx.concurrent).map(|listener| HttpServer {
             listener,
-            inner: HttpAcceptor::new(ctx),
+            inner: HttpAcceptor::new(ctx.clone()),
+            limiter: ctx.limiter,
         })
     }
 
@@ -138,6 +149,7 @@ impl HttpServer {
             .map(|inner| HttpServer {
                 listener: self.listener,
                 inner,
+                limiter: self.limiter,
             })
     }
 }
@@ -164,8 +176,19 @@ where
                     }
                 }
                 conn = HttpServer::<A>::incoming(&mut self.listener) => {
+                    // Admission control: at capacity, close new connections
+                    // immediately instead of letting them pile up.
+                    let Ok(permit) = self.limiter.clone().try_acquire_owned() else {
+                        tracing::debug!("[HTTP] concurrent limit reached, rejecting connection");
+                        continue;
+                    };
+                    let inner = self.inner.clone();
+                    let connection_handle = handle.clone();
                     connections.spawn_on(
-                        self.inner.clone().accept(conn, handle.clone()),
+                        async move {
+                            let _permit = permit;
+                            inner.accept(conn, connection_handle).await
+                        },
                         &pingora_runtime::current_handle(),
                     );
                 }
